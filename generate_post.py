@@ -2054,12 +2054,19 @@ def run() -> None:
     if len(sys.argv) > 1 and sys.argv[1].strip() and sys.argv[1].strip().lower() not in ["publish", "refresh"]:
         manual_title = sys.argv[1].strip()
 
+    # [FIX] 기존에는 "제목을 직접 입력했을 때만" 하루 발행 한도를 무시했습니다. 그런데 GitHub Actions에서
+    # 제목 입력 없이 workflow_dispatch(수동 실행 버튼)로 돌린 경우도 "수동 발행"이므로, 자동 스케줄(cron)과
+    # 구분해 하루 한도와 무관하게 항상 발행되도록 합니다. GITHUB_EVENT_NAME은 GitHub Actions가 모든 스텝에
+    # 자동으로 제공하는 환경변수라 워크플로 파일 수정 없이도 바로 동작합니다.
+    is_manual_dispatch = os.environ.get("GITHUB_EVENT_NAME", "").strip() == "workflow_dispatch"
+    bypass_daily_limit = bool(manual_title) or is_manual_dispatch
+
     title = ""
     if manual_title:
         title = manual_title
     else:
-        # [개편] 트렌드 감지 게이트가 사라졌으므로 하루 발행 한도로 콘텐츠 팜화 방지
-        if not check_daily_limit():
+        # [개편] 트렌드 감지 게이트가 사라졌으므로 하루 발행 한도로 콘텐츠 팜화 방지 (단, 수동 실행은 예외)
+        if not bypass_daily_limit and not check_daily_limit():
             logger.info(f"오늘의 발행 한도({DAILY_PUBLISH_LIMIT}회)를 모두 소진하여 포스팅을 생략합니다.")
             return
 
@@ -2104,7 +2111,7 @@ def run() -> None:
     # source_url 인자는 더 이상 본문에 노출되지 않지만, 추후 필요시를 대비해 시그니처는 유지.
     publish_to_wordpress(article, blogger_url or post_url, thumb_url, local_thumb_path)
 
-    if not manual_title:
+    if not bypass_daily_limit:
         increment_daily_count()
 
     logger.info(f"저장 완료: docs/{post_meta['file']}, docs/{post_meta['thumb']}")
