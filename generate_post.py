@@ -2,7 +2,9 @@
 """
 GitHub Actions 위에서 실행되는 자동 블로그 파이프라인 스크립트 (통합판)
 - [개편] 구글 트렌드 기반 소싱을 폐기하고, 에버그린 주제 뱅크(가이드/비교/체크리스트/FAQ/용어정리) 기반으로 전면 전환
-- [개편] 카테고리별 수익화 가중치(재테크·보험대출·정부지원금·헬스 우선) 반영, 하루 6회 발행 상한
+- [개편] 카테고리별 수익화 가중치(재테크·보험대출·정부지원금·헬스 우선) 반영, 하루 자동 발행 2회 상한(수동 실행은 무제한)
+- [FIX] KST(한국시간) 고정 — 요일별 우선 테마/일일 집계/기사 내 날짜 표기가 UTC로 어긋나던 문제 수정
+- [FIX] 에버그린 주제 뱅크를 엔티티×앵글 조합형으로 확장(카테고리당 72개, 총 1,080개) — 365일 이상 재사용 없이 운영 가능
 - [업그레이드] 방문자 언어 감지 자동 번역 (버튼 숨김) 및 표 1.5배 확대 기능
 """
 
@@ -20,7 +22,7 @@ import sys
 import textwrap
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 import requests
@@ -35,6 +37,18 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
+# =====================================================================
+# [FIX] 타임존 고정 (KST)
+# - GitHub Actions 실행 환경은 UTC입니다. datetime.now()를 그대로 쓰면 한국 자정~오전 9시
+#   사이에 요일/날짜가 하루 밀려서, 요일별 우선 테마 선정·일일 발행량 집계·기사 본문의
+#   "오늘 날짜" 표기가 서로 어긋나는 문제가 있었습니다. 이제 항상 한국 시간(KST, UTC+9)
+#   기준으로 계산하도록 고정합니다.
+# =====================================================================
+KST = timezone(timedelta(hours=9))
+
+def now_kst() -> datetime:
+    return datetime.now(KST)
 
 # =====================================================================
 # 큐 파일 설정
@@ -176,25 +190,6 @@ DEFAULT_THEME = CATEGORY_THEMES["라이프스타일"]
 def get_theme(category: str) -> Dict[str, Any]:
     return CATEGORY_THEMES.get(category, DEFAULT_THEME)
 
-ILLUSTRATION_PROMPTS = {
-    "뷰티패션": "minimalist pencil sketch style illustration of cosmetics lipstick and fashion clothing items, clean line art",
-    "푸드맛집": "minimalist pencil sketch style illustration of food dishes and cafe coffee items, clean line art",
-    "여행": "minimalist pencil sketch style illustration of travel landscape airplane suitcase palm tree, clean line art",
-    "테크IT": "minimalist pencil sketch style illustration of laptop computer and technology icons, clean modern line art",
-    "재테크머니": "minimalist pencil sketch style illustration of coins money and finance growth chart, clean line art",
-    "헬스운동": "minimalist pencil sketch style illustration of fitness workout dumbbell and healthy food, clean line art",
-    "홈인테리어": "minimalist pencil sketch style illustration of cozy home interior furniture and plants, clean line art",
-    "대출보험": "minimalist pencil sketch style illustration of bank building document and contract, clean professional line art",
-    "정부지원금": "minimalist pencil sketch style illustration of government building document and checklist, clean line art",
-    "라이프스타일": "minimalist pencil sketch style illustration of coffee book and cozy lifestyle items, clean line art",
-    "산사워케이션": "minimalist pencil sketch style illustration of mountain temple and laptop workspace, clean line art",
-    "종가음식": "minimalist pencil sketch style illustration of traditional korean dining table, clean line art",
-    "한방웰니스": "minimalist pencil sketch style illustration of korean herbal tea and spa elements, clean line art",
-    "K공예인테리어": "minimalist pencil sketch style illustration of korean pottery and craft interior, clean line art",
-    "가양주": "minimalist pencil sketch style illustration of traditional korean rice wine bottle, clean line art",
-}
-ILLUSTRATION_SUFFIX = ", simple outline shapes, white background, isolated black or monochromatic vector lines, no watermark, no text"
-
 # --- [NEW] 썸네일용 무료 스톡 이미지(출처 표기) 검색 설정 ---
 # 기존 "AI로 썸네일 이미지 생성" 방식을 없애고, Pexels 무료 이미지 API에서 실제 사진을 검색해
 # 저작권 출처(작가명/링크)를 함께 표기하는 방식으로 변경합니다.
@@ -227,109 +222,164 @@ STOCK_SEARCH_TERMS = {
 # - CATEGORY_WEIGHT: 카테고리별 수익화 가중치. AdSense CPC/제휴 전환율이 높은 재테크·보험대출·
 #   정부지원금·헬스 카테고리에 더 자주 노출되도록 가중치를 부여합니다.
 # =====================================================================
-EVERGREEN_TOPIC_BANK: Dict[str, List[str]] = {
+# =====================================================================
+# [개편] 에버그린 주제 뱅크: 엔티티 × 앵글 조합형 생성
+# - [FIX] 기존에는 카테고리당 8~10개씩 수작업으로 나열해, 하루 여러 건 발행 시 몇 주 안에
+#   소재가 고갈되고(재사용 로직도 없어 고갈 시 파이프라인이 조용히 멈춤) 365일 무재사용
+#   운영이 불가능했습니다.
+# - 이제 카테고리마다 "구체적 대상(엔티티)"과 "실용적 관점(앵글)"을 따로 큐레이션해두고,
+#   두 목록을 조합(entity × angle)해 카테고리당 수십~100개 이상의 실제로 쓸모 있는 주제를
+#   생성합니다. 각 조합은 의미 없는 키워드 뭉치가 아니라 실제 검색 의도에 맞는 구체적
+#   문장이며, 최종 제목/본문은 SYSTEM_PROMPT가 별도로 다시 다듬으므로 이 문자열은 AI에게
+#   전달하는 "주제 시드" 역할만 합니다.
+# - 하루 자동 발행 2회 기준으로도 1년(365일) 이상 중복 없이 소진되지 않는 분량을 확보했고,
+#   완전 소진 전에는 절대 재사용하지 않습니다(재사용 로직 없음, 의도적).
+# =====================================================================
+CATEGORY_ENTITIES: Dict[str, List[str]] = {
     "재테크머니": [
-        "ISA 계좌 개설 방법과 세금 혜택 총정리", "연금저축과 IRP 차이 완벽 비교",
-        "청년도약계좌 조건과 신청 방법 체크리스트", "예금자보호법 한도 5천만원, 분산예치 전략",
-        "코스피 코스닥 차이, 초보자를 위한 안내", "적금 vs 예금 vs CMA, 목적별 비교 가이드",
-        "신용점수 올리는 방법 9가지", "퇴직연금 DB형 DC형 차이와 선택 기준",
-        "재테크 초보자를 위한 첫 포트폴리오 짜는 법", "금리 인상기 대출 갈아타기 체크리스트",
+        "ISA 계좌", "연금저축펀드", "IRP(개인형퇴직연금)", "청년도약계좌", "예금자보호제도",
+        "코스피 지수 투자", "코스닥 소형주 투자", "채권형 펀드", "리츠(REITs)", "달러 예금",
+        "금 투자(골드바·골드뱅킹)", "배당주 투자",
     ],
     "대출보험": [
-        "전세자금대출 조건과 한도 비교 가이드", "실손보험 갱신 전 꼭 확인할 체크리스트",
-        "신용대출 vs 담보대출 차이 완벽 정리", "자동차보험 할인 특약 종류와 가입 팁",
-        "보험 리모델링 할 때 주의할 점", "정책서민금융상품 종류와 신청 자격 총정리",
-        "중도상환수수료 계산법과 절감 방법", "DSR DTI LTV 용어 정리, 헷갈리는 대출 규제",
-        "암보험 가입 전 꼭 알아야 할 주의점", "카드론 현금서비스 차이와 상환 전략",
+        "전세자금대출", "신용대출", "주택담보대출", "자동차보험", "실손의료보험", "암보험",
+        "정책서민금융상품", "중도상환수수료", "DSR(총부채원리금상환비율)", "신용점수 관리",
+        "카드론", "보험 리모델링",
     ],
     "정부지원금": [
-        "청년내일저축계좌 신청 자격과 방법", "근로장려금 신청 조건 체크리스트",
-        "기초연금 수급 자격과 신청 방법 가이드", "육아휴직급여 계산법과 신청 절차",
-        "소상공인 정책자금 종류 비교", "국민취업지원제도 신청 방법 총정리",
-        "에너지바우처 대상과 신청 방법", "청년월세지원 조건과 신청 체크리스트",
-        "귀농귀촌 지원금 종류와 신청 가이드", "국가장학금 소득분위 계산법 안내",
+        "청년내일저축계좌", "근로장려금", "기초연금", "육아휴직급여", "소상공인 정책자금",
+        "국민취업지원제도", "에너지바우처", "청년월세지원", "귀농귀촌 지원금", "국가장학금",
+        "청년구직활동지원금", "출산장려금",
     ],
     "헬스운동": [
-        "홈트레이닝 초보자를 위한 시작 가이드", "단백질 보충제 종류와 고르는 법 비교",
-        "간헐적 단식 방법과 주의할 점", "런닝 초보자를 위한 페이스 조절법",
-        "체지방률 계산법과 정상 범위 안내", "스트레칭 루틴, 아침저녁 비교 가이드",
-        "근육통과 부상 구분하는 방법", "다이어트 정체기 극복 체크리스트",
-        "필라테스 vs 요가 차이 완벽 비교", "수면의 질 높이는 습관 가이드",
+        "홈트레이닝", "간헐적 단식", "런닝(달리기)", "필라테스", "요가", "근력운동(웨이트트레이닝)",
+        "스트레칭", "단백질 보충제", "체지방률 관리", "수면의 질 관리", "다이어트 정체기 극복",
+        "유산소운동",
     ],
     "테크IT": [
-        "클라우드 저장소 요금제 비교 가이드", "노트북 고를 때 체크리스트 (사양 용어 정리)",
-        "비밀번호 관리자 앱 비교와 선택법", "OTT 서비스 요금제 완벽 비교",
-        "스마트폰 배터리 오래 쓰는 방법", "무료 이미지 편집 프로그램 비교",
-        "이메일 피싱 구별하는 방법 체크리스트", "생성형 AI 서비스 무료 vs 유료 비교",
-        "와이파이 속도 느릴 때 확인할 체크리스트", "중고 전자기기 구매 전 확인사항 가이드",
+        "클라우드 저장소", "비밀번호 관리자 앱", "OTT 서비스", "생성형 AI 서비스", "노트북 구매",
+        "스마트폰 배터리 관리", "무료 이미지 편집 프로그램", "이메일 피싱 대응", "와이파이 속도 문제",
+        "중고 전자기기 구매", "VPN 서비스", "스마트워치",
     ],
     "홈인테리어": [
-        "원룸 인테리어 예산별 가이드", "곰팡이 제거와 재발 방지 방법",
-        "커튼 vs 블라인드 장단점 비교", "이사 전 체크리스트 (버릴 것/챙길 것)",
-        "미니멀 라이프 시작하는 방법", "베란다 확장 전 알아야 할 주의점",
-        "친환경 세제 고르는 법 가이드", "좁은 주방 수납 아이디어 정리",
-        "반려동물과 함께하는 인테리어 팁", "겨울철 난방비 아끼는 방법 체크리스트",
+        "원룸 인테리어", "곰팡이 제거", "커튼과 블라인드", "이사 준비", "미니멀 라이프",
+        "베란다 확장", "친환경 세제", "좁은 주방 수납", "반려동물 인테리어", "겨울철 난방비 절약",
+        "중고가구 활용", "셀프 페인트",
     ],
     "푸드맛집": [
-        "제철 채소 고르는 법과 보관 방법", "에어프라이어 활용 레시피 가이드",
-        "홈베이킹 초보자를 위한 도구 체크리스트", "식품 유통기한과 소비기한 차이 정리",
-        "다이어트 도시락 준비 가이드", "커피 원두 로스팅 단계별 맛 차이 비교",
-        "냉동식품 보관법과 주의할 점", "비건 식단 시작하는 초보자 가이드",
-        "장보기 전 알아두면 좋은 체크리스트", "집들이 요리 메뉴 추천 가이드",
+        "제철 채소 보관", "에어프라이어 요리", "홈베이킹", "식품 유통기한 관리", "다이어트 도시락",
+        "커피 원두 로스팅", "냉동식품 보관", "비건 식단", "장보기 계획", "집들이 요리",
+        "밀프렙(meal prep)", "제철 과일 고르기",
     ],
     "여행": [
-        "저가항공 티켓 싸게 사는 방법", "여행자보험 가입 전 체크리스트",
-        "캐리어 고를 때 확인할 사항 가이드", "해외여행 유심 vs 로밍 비교",
-        "국내 캠핑장 예약 꿀팁 정리", "여권 만료 확인과 재발급 방법",
-        "면세점 쇼핑 한도와 세관 신고 안내", "혼자 떠나는 여행 준비 체크리스트",
-        "여행 짐 싸기 노하우, 계절별 가이드", "공항 라운지 이용 조건 비교",
+        "저가항공 티켓", "여행자보험", "캐리어 구매", "해외 유심·로밍", "국내 캠핑",
+        "여권 재발급", "면세점 쇼핑", "혼자 떠나는 여행", "짐 싸기 노하우", "공항 라운지 이용",
+        "국내 항공 마일리지", "장기 배낭여행",
     ],
     "뷰티패션": [
-        "피부타입별 스킨케어 루틴 가이드", "쿠션 파운데이션 vs 팩트 비교",
-        "자외선차단제 고르는 법 체크리스트", "머리카락 손상 줄이는 관리법",
-        "체형별 옷 코디 가이드", "저자극 화장품 성분표 읽는 법",
-        "각질 관리 방법과 주의할 점", "향수 지속력 높이는 방법",
-        "겨울철 피부 건조 관리 가이드", "미니멀 옷장 만들기 체크리스트",
+        "스킨케어 루틴", "쿠션 파운데이션", "자외선차단제", "헤어 손상 관리", "체형별 코디",
+        "저자극 화장품", "각질 관리", "향수 사용법", "겨울철 피부 건조 관리", "미니멀 옷장",
+        "메이크업 지속력", "네일케어",
     ],
     "라이프스타일": [
-        "미루는 습관 고치는 방법", "아침 루틴 만들기 가이드",
-        "가계부 작성법, 초보자를 위한 안내", "번아웃 자가진단 체크리스트",
-        "독서 습관 만드는 방법", "디지털 디톡스 시작하는 가이드",
-        "감정일기 쓰는 법과 효과", "집중력 높이는 환경 만들기 체크리스트",
-        "새해 목표 세우는 방법 (SMART 기법)", "인간관계 스트레스 줄이는 법",
+        "미루는 습관 고치기", "아침 루틴", "가계부 작성", "번아웃 관리", "독서 습관",
+        "디지털 디톡스", "감정일기", "집중력 관리", "새해 목표 설정", "인간관계 스트레스 관리",
+        "미니멀리즘 실천", "시간관리(타임블로킹)",
     ],
-    # --- [NEW] K-문화 블루오션 카테고리 (사용자 제안 큐레이션 반영, 요일별 우선 테마) ---
+    # --- K-문화 블루오션 카테고리 (요일별 우선 테마) ---
     "산사워케이션": [
-        "산사 워케이션 가능한 전국 사찰 리스트", "사찰 워케이션 장기 체류 비용 비교 가이드",
-        "산사 워케이션 와이파이 속도·업무 집중도 후기 정리", "일과 후 명상 프로그램 참여 방법 안내",
-        "템플스테이 vs 산사 워케이션 차이 비교", "디지털 노마드를 위한 사찰 워케이션 체크리스트",
-        "산사 워케이션 예약 방법과 준비물 가이드", "원격근무자를 위한 산사 워케이션 후기 모음",
+        "전국 워케이션 사찰", "장기 체류형 템플스테이", "사찰 와이파이·업무환경", "디지털 노마드 사찰",
+        "명상 프로그램", "사찰 예약 플랫폼", "계절별 산사 워케이션", "지자체 워케이션 지원사업",
+        "산사 워케이션 비용", "업무 집중도 높은 사찰", "산사 워케이션 짐 싸기", "1인 산사 워케이션",
     ],
     "종가음식": [
-        "종가 내림음식 프라이빗 다이닝 예약 방법 가이드", "지역별 대표 종가 시그니처 메뉴 비교",
-        "종갓집 내림음식 예약 시 지켜야 할 에티켓", "고택 숙박(한옥 스테이)과 종가음식 연계 코스 가이드",
-        "종가음식과 일반 한정식 차이 비교", "안동 종가음식 체험 후기와 예약 팁",
-        "종부님이 전하는 내림음식 조리법의 특징 정리", "종가음식 프라이빗 다이닝 가격대 비교",
+        "안동 종가음식", "종가 프라이빗 다이닝", "종택 숙박", "고택 체험", "종가 예약 플랫폼",
+        "지역별 종가음식", "종부 내림음식", "내림음식 코스요리", "한옥 미식 여행", "종가음식 에티켓",
+        "종가 장류(간장·된장)", "종가 다과상",
     ],
     "한방웰니스": [
-        "사상체질 진단 방법과 체질별 특징 정리", "체질별 한방 스파 추천 가이드",
-        "한방 족욕·입욕 전문 웰니스 센터 고르는 법", "체질 맞춤 한방차 재료 소싱 방법",
-        "약선 밀키트 정기구독 서비스 비교", "한방 스파와 일반 스파 차이 비교",
-        "사상체질별 어울리는 음식 체크리스트", "한방 웰니스 초보자를 위한 안내",
+        "사상체질 진단", "체질별 한방차", "한방 스파", "약선 음식", "체질별 식단", "한방 족욕",
+        "웰니스 여행", "약선 밀키트 구독", "한방 힐링 프로그램", "사상체질 생활습관",
+        "체질별 운동법", "한방 입욕제",
     ],
     "K공예인테리어": [
-        "소반을 커피테이블로 활용하는 인테리어 팁", "나전칠기 입문용 브랜드 비교 가이드",
-        "달항아리 모던 인테리어 배치 아이디어", "K-공예 원데이클래스 체험 가이드",
-        "신진 공예 작가 가성비 입문 브랜드 리스트", "전통 공예품 현대 인테리어 활용 체크리스트",
-        "옻칠 식기 만들기 원데이클래스 후기 정리", "1인 가구를 위한 K-공예 소품 활용법",
+        "달항아리 인테리어", "나전칠기 소품", "소반 활용법", "공예 원데이클래스", "신진 공예작가 브랜드",
+        "옻칠 식기", "한지 공예", "전통 자수 소품", "한옥 인테리어 소품", "공예 선물 고르기",
+        "도자기 공방 체험", "전통 매듭공예",
     ],
     "가양주": [
-        "지역별 소규모 가양주 양조장 투어 가이드", "가양주와 어울리는 안주 페어링 정리",
-        "전통주 구독 서비스 장단점 비교", "집에서 이화주(떠먹는 막걸리) 담그는 키트 후기",
-        "가양주 vs 시판 막걸리 차이 비교", "전통주 초보자를 위한 용어 정리",
-        "가양주 양조장 투어 준비물 체크리스트", "대중교통으로 가는 전통주 양조장 안내",
+        "가양주 양조장 투어", "이화주(떠먹는 막걸리)", "전통주 구독 서비스", "막걸리 안주 페어링",
+        "숨은 지역 양조장", "계절 전통주", "홈텐딩(집에서 술 만들기)", "전통주 시음회",
+        "증류식 소주", "약주와 청주 차이", "전통주 선물세트", "전통주 페스티벌",
     ],
 }
+
+# 카테고리군별 앵글(실용적 관점) 템플릿. {e}에 위 엔티티가 대입됩니다.
+_FINANCE_ANGLES = [
+    "{e} 조건과 신청 방법 총정리", "{e} 신청 전 체크리스트", "{e} 장단점 완벽 비교",
+    "{e} 초보자를 위한 안내", "{e} 자주 묻는 질문(FAQ) 정리", "{e} 주의할 점과 유의사항",
+]
+_HEALTH_ANGLES = [
+    "{e} 시작하는 법, 초보자 가이드", "{e} 효과와 부작용 비교", "{e} 루틴 짜는 방법",
+    "{e} 전 꼭 확인할 체크리스트", "{e} 자주 묻는 질문 정리", "{e} 고를 때 주의할 점",
+]
+_TECH_ANGLES = [
+    "{e} 고를 때 체크리스트", "{e} 무료 vs 유료 비교", "{e} 설정 방법 총정리",
+    "{e} 초보자를 위한 안내", "{e} 자주 묻는 질문 정리", "{e} 사용 시 주의할 점",
+]
+_HOME_ANGLES = [
+    "{e} 예산별 가이드", "{e} 고를 때 비교 정리", "{e} 셀프로 하는 방법",
+    "{e} 전 체크리스트", "{e} 아이디어 모음", "{e} 주의할 점",
+]
+_FOOD_ANGLES = [
+    "{e} 보관법과 유통기한 정리", "{e} 고르는 법 비교", "{e} 초보자를 위한 레시피 가이드",
+    "{e} 준비 체크리스트", "{e} 자주 묻는 질문 정리", "{e} 활용 팁 모음",
+]
+_TRAVEL_ANGLES = [
+    "{e} 준비물 체크리스트", "{e} 예약 꿀팁 정리", "{e} 초보자를 위한 가이드",
+    "{e} 비교 가이드", "{e} 주의할 점", "{e} 후기 모음",
+]
+_BEAUTY_ANGLES = [
+    "{e} 루틴 가이드", "{e} 고르는 법 비교", "{e} 성분·주의사항 체크리스트",
+    "{e} 초보자를 위한 안내", "{e} 자주 묻는 질문 정리", "{e} 관리 방법",
+]
+_LIFESTYLE_ANGLES = [
+    "{e} 시작하는 방법", "{e} 습관 만들기 가이드", "{e} 체크리스트",
+    "{e} 초보자를 위한 안내", "{e} 비교 정리", "{e} 주의할 점",
+]
+_KCULTURE_ANGLES = [
+    "{e} 체험 방법과 준비물", "{e} 예약 방법 총정리", "{e} 비교 가이드",
+    "{e} 체크리스트", "{e} 초보자를 위한 안내", "{e} 후기와 주의할 점",
+]
+
+CATEGORY_ANGLE_TEMPLATES: Dict[str, List[str]] = {
+    "재테크머니": _FINANCE_ANGLES, "대출보험": _FINANCE_ANGLES, "정부지원금": _FINANCE_ANGLES,
+    "헬스운동": _HEALTH_ANGLES, "테크IT": _TECH_ANGLES, "홈인테리어": _HOME_ANGLES,
+    "푸드맛집": _FOOD_ANGLES, "여행": _TRAVEL_ANGLES, "뷰티패션": _BEAUTY_ANGLES,
+    "라이프스타일": _LIFESTYLE_ANGLES,
+    "산사워케이션": _KCULTURE_ANGLES, "종가음식": _KCULTURE_ANGLES, "한방웰니스": _KCULTURE_ANGLES,
+    "K공예인테리어": _KCULTURE_ANGLES, "가양주": _KCULTURE_ANGLES,
+}
+
+def _build_topic_bank() -> Dict[str, List[str]]:
+    """엔티티 × 앵글 조합으로 카테고리별 주제 목록을 생성합니다.
+    (12개 엔티티 × 6개 앵글 = 카테고리당 72개, 총 15개 카테고리 약 1,080개 →
+    하루 자동 2회 발행 기준으로도 1년 이상 중복 없이 운용 가능한 분량입니다.)"""
+    bank: Dict[str, List[str]] = {}
+    for category, entities in CATEGORY_ENTITIES.items():
+        angles = CATEGORY_ANGLE_TEMPLATES.get(category, _LIFESTYLE_ANGLES)
+        topics: List[str] = []
+        seen = set()
+        for angle_tpl in angles:
+            for e in entities:
+                topic = angle_tpl.format(e=e)
+                if topic not in seen:
+                    seen.add(topic)
+                    topics.append(topic)
+        bank[category] = topics
+    return bank
+
+EVERGREEN_TOPIC_BANK: Dict[str, List[str]] = _build_topic_bank()
 # 카테고리별 수익화 가중치 (숫자가 클수록 큐에 더 자주 편성됨)
 CATEGORY_WEIGHT: Dict[str, int] = {
     "재테크머니": 3, "대출보험": 3, "정부지원금": 3, "헬스운동": 2, "테크IT": 2,
@@ -359,7 +409,7 @@ def pick_next_topic(queue: Dict[str, Any]) -> Optional[str]:
     if not pending:
         return None
 
-    today_category = WEEKDAY_THEME_CATEGORY.get(datetime.now().weekday())
+    today_category = WEEKDAY_THEME_CATEGORY.get(now_kst().weekday())
     if today_category:
         matches = [t for t in pending if _topic_category(t) == today_category]
         if matches:
@@ -439,11 +489,11 @@ def refill_evergreen_queue(target_size: int = 20) -> None:
     logger.info(f"[에버그린 주제뱅크] 신규 편성: {len(picked)}개 (대기 {len(queue['pending'])}개)")
     logger.info("=" * 60)
 
-DAILY_PUBLISH_LIMIT = 6  # [개편] 트렌드 감지 게이트가 사라졌으므로, 콘텐츠 팜처럼 보이지 않게 하루 상한을 다시 둠(품질 우선)
+DAILY_PUBLISH_LIMIT = 2  # [FIX] 하루 자동(스케줄) 발행은 2회로 제한. 단, 수동 실행(제목 직접 입력)은 이 한도와 무관하게 항상 발행됩니다(run()의 manual_title 분기 참고).
 
 def check_daily_limit() -> bool:
     queue = load_queue()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_kst().strftime("%Y-%m-%d")
     daily_stats = queue.get("daily_stats", {"date": "", "count": 0})
     if daily_stats.get("date") != today_str:
         return True
@@ -451,7 +501,7 @@ def check_daily_limit() -> bool:
 
 def increment_daily_count() -> None:
     queue = load_queue()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_kst().strftime("%Y-%m-%d")
     daily_stats = queue.get("daily_stats", {"date": today_str, "count": 0})
     if daily_stats.get("date") == today_str:
         daily_stats["count"] = daily_stats.get("count", 0) + 1
@@ -903,7 +953,7 @@ def generate_article(title: str) -> Dict[str, Any]:
     url = GEMINI_URL.format(api_key=GEMINI_API_KEY)
     payload = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": f"오늘 날짜: {datetime.now().strftime('%Y년 %m월 %d일')}\n\n주제: '{title}'\n\n이 주제에 대해 검색으로 찾아온 독자가 실제로 궁금해할 조건·절차·비교·주의사항을 중심으로, 정확하고 실용적인 가이드형 블로그 글을 작성해주세요. 확실하지 않은 정보는 단정하지 말고, 공식 기관 확인이 필요한 내용은 그렇게 안내해주세요. 시점을 언급할 때는 반드시 위에 적힌 '오늘 날짜'를 기준으로 하고, 이보다 오래된 연도를 임의로 쓰지 마세요."}]}],
+        "contents": [{"role": "user", "parts": [{"text": f"오늘 날짜: {now_kst().strftime('%Y년 %m월 %d일')}\n\n주제: '{title}'\n\n이 주제에 대해 검색으로 찾아온 독자가 실제로 궁금해할 조건·절차·비교·주의사항을 중심으로, 정확하고 실용적인 가이드형 블로그 글을 작성해주세요. 확실하지 않은 정보는 단정하지 말고, 공식 기관 확인이 필요한 내용은 그렇게 안내해주세요. 시점을 언급할 때는 반드시 위에 적힌 '오늘 날짜'를 기준으로 하고, 이보다 오래된 연도를 임의로 쓰지 마세요."}]}],
         # [FIX] JSON 파싱 실패를 줄이기 위해 순수 JSON 출력을 강제하고 출력 토큰 한도를 명시적으로 늘림
         "generationConfig": {
             "responseMimeType": "application/json",
@@ -1498,7 +1548,7 @@ def save_post(article: Dict[str, Any]) -> Tuple[Dict[str, Any], str, str, str, s
     category = article.get("category", "라이프스타일")
     theme = get_theme(category)
     slug = slugify(article["keyword"])
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
     thumb_filename = f"{slug}-{today}.webp"
     post_filename = f"{slug}-{today}.html"
     photo_credit = generate_thumbnail(article["title"], os.path.join(DOCS_DIR, "thumbs", thumb_filename), theme, category, article.get("image_keywords", ""))
@@ -1602,7 +1652,7 @@ def update_index(new_post: Dict[str, Any]) -> List[Dict[str, Any]]:
             hero_html=hero_html, mid_html=mid_html, bottom_html=bottom_html, blog_json_ld=build_blog_index_json_ld(posts),
             category_pills=category_pills, search_console_meta=_search_console_meta(),
             footer_html='<div class="site-footer"><a href="about.html">블로그 소개</a>·<a href="privacy.html">개인정보처리방침</a>·<a href="contact.html">문의하기</a>'
-                        f'<div style="margin-top:8px;">© {datetime.now().year} {SITE_TITLE}</div></div>',
+                        f'<div style="margin-top:8px;">© {now_kst().year} {SITE_TITLE}</div></div>',
             translate_widget=_translate_widget(),
             site_title_short=SITE_TITLE[:12],
         ))
@@ -1727,7 +1777,7 @@ def publish_to_blogger(article: Dict[str, Any], canonical_url: str, thumb_url: s
     try:
         access_token = _get_blogger_access_token()
         theme = get_theme(article.get("category", "라이프스타일"))
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = now_kst().strftime("%Y-%m-%d")
         blogger_json_ld = build_json_ld(article, canonical_url, thumb_url, today, platform="blogger")
         # [FIX] base64는 요약 스니펫 글자수 제한 안에서 이미지가 아예 안 뜨는 원인이었음.
         # 사전 push가 보장되므로 실제 GitHub Pages URL(thumb_url)을 그대로 사용.
@@ -1981,7 +2031,7 @@ def commit_and_push_changes() -> bool:
         if diff_check.returncode == 0:
             logger.info("[git] 변경사항 없음, 사전 push 생략")
             return True
-        commit_msg = f"자동 파이프라인 실행(사전 push): {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        commit_msg = f"자동 파이프라인 실행(사전 push): {now_kst().strftime('%Y-%m-%d %H:%M')}"
         subprocess.run(["git", "commit", "-m", commit_msg], check=True, capture_output=True)
         subprocess.run(["git", "push"], check=True, capture_output=True)
         logger.info("[git] GitHub Pages 사전 push 완료 (외부 발행 시 이미지 URL이 실제로 존재함을 보장)")
